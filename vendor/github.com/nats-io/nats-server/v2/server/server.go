@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,7 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -98,6 +98,7 @@ type Info struct {
 	GatewayCmd        byte     `json:"gateway_cmd,omitempty"`         // Command code for the receiving server to know what to do
 	GatewayCmdPayload []byte   `json:"gateway_cmd_payload,omitempty"` // Command payload when needed
 	GatewayNRP        bool     `json:"gateway_nrp,omitempty"`         // Uses new $GNR. prefix for mapped replies
+	GatewayIOM        bool     `json:"gateway_iom,omitempty"`         // Indicate that all accounts will be switched to InterestOnly mode "right away"
 
 	// LeafNode Specific
 	LeafNodeURLs  []string `json:"leafnode_urls,omitempty"`  // LeafNode URLs that the server can reconnect to.
@@ -106,11 +107,13 @@ type Info struct {
 
 // Server is our main struct.
 type Server struct {
+	// Fields accessed with atomic operations need to be 64-bit aligned
 	gcid uint64
+	// How often user logon fails due to the issuer account not being pinned.
+	pinnedAccFail uint64
 	stats
-	mu                  sync.Mutex
+	mu                  sync.RWMutex
 	kp                  nkeys.KeyPair
-	prand               *rand.Rand
 	info                Info
 	configFile          string
 	optsMu              sync.RWMutex
@@ -160,8 +163,11 @@ type Server struct {
 	}
 	leafRemoteCfgs     []*leafNodeCfg
 	leafRemoteAccounts sync.Map
+	leafNodeEnabled    bool
+	leafDisableConnect bool // Used in test only
 
 	quitCh           chan struct{}
+	startupComplete  chan struct{}
 	shutdownComplete chan struct{}
 
 	// Tracking Go routines
@@ -258,21 +264,44 @@ type Server struct {
 	rerrMu   sync.Mutex
 	rerrLast time.Time
 
+	connRateCounter *rateCounter
+
 	// If there is a system account configured, to still support the $G account,
 	// the server will create a fake user and add it to the list of users.
 	// Keep track of what that user name is for config reload purposes.
 	sysAccOnlyNoAuthUser string
 
-	// How often user logon fails due to the issuer account not being pinned.
-	pinnedAccFail uint64
+	// IPQueues map
+	ipQueues sync.Map
+
+	// To limit logging frequency
+	rateLimitLogging   sync.Map
+	rateLimitLoggingCh chan time.Duration
+
+	// Total outstanding catchup bytes in flight.
+	gcbMu     sync.RWMutex
+	gcbOut    int64
+	gcbOutMax int64 // Taken from JetStreamMaxCatchup or defaultMaxTotalCatchupOutBytes
+	// A global chanel to kick out stalled catchup sequences.
+	gcbKick chan struct{}
+
+	// Total outbound syncRequests
+	syncOutSem chan struct{}
+
+	// Queue to process JS API requests that come from routes (or gateways)
+	jsAPIRoutedReqs *ipQueue
 }
 
 // For tracking JS nodes.
 type nodeInfo struct {
 	name    string
+	version string
 	cluster string
 	domain  string
 	id      string
+	tags    jwt.TagList
+	cfg     *JetStreamConfig
+	stats   *JetStreamStats
 	offline bool
 	js      bool
 }
@@ -347,19 +376,31 @@ func NewServer(opts *Options) (*Server, error) {
 	now := time.Now().UTC()
 
 	s := &Server{
-		kp:           kp,
-		configFile:   opts.ConfigFile,
-		info:         info,
-		prand:        rand.New(rand.NewSource(time.Now().UnixNano())),
-		opts:         opts,
-		done:         make(chan bool, 1),
-		start:        now,
-		configTime:   now,
-		gwLeafSubs:   NewSublistWithCache(),
-		httpBasePath: httpBasePath,
-		eventIds:     nuid.New(),
-		routesToSelf: make(map[string]struct{}),
-		httpReqStats: make(map[string]uint64), // Used to track HTTP requests
+		kp:                 kp,
+		configFile:         opts.ConfigFile,
+		info:               info,
+		opts:               opts,
+		done:               make(chan bool, 1),
+		start:              now,
+		configTime:         now,
+		gwLeafSubs:         NewSublistWithCache(),
+		httpBasePath:       httpBasePath,
+		eventIds:           nuid.New(),
+		routesToSelf:       make(map[string]struct{}),
+		httpReqStats:       make(map[string]uint64), // Used to track HTTP requests
+		rateLimitLoggingCh: make(chan time.Duration, 1),
+		leafNodeEnabled:    opts.LeafNode.Port != 0 || len(opts.LeafNode.Remotes) > 0,
+		syncOutSem:         make(chan struct{}, maxConcurrentSyncRequests),
+	}
+
+	// Fill up the maximum in flight syncRequests for this server.
+	// Used in JetStream catchup semantics.
+	for i := 0; i < maxConcurrentSyncRequests; i++ {
+		s.syncOutSem <- struct{}{}
+	}
+
+	if opts.TLSRateLimit > 0 {
+		s.connRateCounter = newRateCounter(opts.tlsConfigOpts.RateLimit)
 	}
 
 	// Trusted root operator keys.
@@ -383,9 +424,21 @@ func NewServer(opts *Options) (*Server, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Place ourselves in some lookup maps.
-	ourNode := string(getHash(serverName))
-	s.nodeToInfo.Store(ourNode, nodeInfo{serverName, opts.Cluster.Name, opts.JetStreamDomain, info.ID, false, opts.JetStream})
+	// Place ourselves in the JetStream nodeInfo if needed.
+	if opts.JetStream {
+		ourNode := string(getHash(serverName))
+		s.nodeToInfo.Store(ourNode, nodeInfo{
+			serverName,
+			VERSION,
+			opts.Cluster.Name,
+			opts.JetStreamDomain,
+			info.ID,
+			opts.Tags,
+			&JetStreamConfig{MaxMemory: opts.JetStreamMaxMemory, MaxStore: opts.JetStreamMaxStore, CompressOK: true},
+			nil,
+			false, true,
+		})
+	}
 
 	s.routeResolver = opts.Cluster.resolver
 	if s.routeResolver == nil {
@@ -447,6 +500,11 @@ func NewServer(opts *Options) (*Server, error) {
 	// Used to kick out all go routines possibly waiting on server
 	// to shutdown.
 	s.quitCh = make(chan struct{})
+
+	// Closed when startup is complete. ReadyForConnections() will block on
+	// this before checking the presence of listening sockets.
+	s.startupComplete = make(chan struct{})
+
 	// Closed when Shutdown() is complete. Allows WaitForShutdown() to block
 	// waiting for complete shutdown.
 	s.shutdownComplete = make(chan struct{})
@@ -465,7 +523,7 @@ func NewServer(opts *Options) (*Server, error) {
 	}
 	// For other resolver:
 	// In operator mode, when the account resolver depends on an external system and
-	// the system account can't fetched, inject a temporary one.
+	// the system account can't be fetched, inject a temporary one.
 	if ar := s.accResolver; len(opts.TrustedOperators) == 1 && ar != nil &&
 		opts.SystemAccount != _EMPTY_ && opts.SystemAccount != DEFAULT_SYSTEM_ACCOUNT {
 		if _, ok := ar.(*MemAccResolver); !ok {
@@ -473,7 +531,7 @@ func NewServer(opts *Options) (*Server, error) {
 			var a *Account
 			// perform direct lookup to avoid warning trace
 			if _, err := fetchAccount(ar, s.opts.SystemAccount); err == nil {
-				a, _ = s.fetchAccount(s.opts.SystemAccount)
+				a, _ = s.lookupAccount(s.opts.SystemAccount)
 			}
 			s.mu.Lock()
 			if a == nil {
@@ -500,11 +558,28 @@ func NewServer(opts *Options) (*Server, error) {
 	return s, nil
 }
 
+func (s *Server) logRejectedTLSConns() {
+	defer s.grWG.Done()
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.quitCh:
+			return
+		case <-t.C:
+			blocked := s.connRateCounter.countBlocked()
+			if blocked > 0 {
+				s.Warnf("Rejected %d connections due to TLS rate limiting", blocked)
+			}
+		}
+	}
+}
+
 // clusterName returns our cluster name which could be dynamic.
 func (s *Server) ClusterName() string {
-	s.mu.Lock()
+	s.mu.RLock()
 	cn := s.info.Cluster
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return cn
 }
 
@@ -557,6 +632,11 @@ func (s *Server) setClusterName(name string) {
 // Return whether the cluster name is dynamic.
 func (s *Server) isClusterNameDynamic() bool {
 	return s.getOpts().Cluster.Name == _EMPTY_
+}
+
+// Returns our configured serverName.
+func (s *Server) serverName() string {
+	return s.getOpts().ServerName
 }
 
 // ClientURL returns the URL used to connect clients. Helpful in testing
@@ -652,9 +732,9 @@ func (s *Server) setOpts(opts *Options) {
 }
 
 func (s *Server) globalAccount() *Account {
-	s.mu.Lock()
+	s.mu.RLock()
 	gacc := s.gacc
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return gacc
 }
 
@@ -862,7 +942,7 @@ func (s *Server) globalAccountOnly() bool {
 		return false
 	}
 
-	s.mu.Lock()
+	s.mu.RLock()
 	s.accounts.Range(func(k, v interface{}) bool {
 		acc := v.(*Account)
 		// Ignore global and system
@@ -872,7 +952,7 @@ func (s *Server) globalAccountOnly() bool {
 		hasOthers = true
 		return false
 	})
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	return !hasOthers
 }
@@ -902,10 +982,10 @@ func (s *Server) ActivePeers() (peers []string) {
 // isTrustedIssuer will check that the issuer is a trusted public key.
 // This is used to make sure an account was signed by a trusted operator.
 func (s *Server) isTrustedIssuer(issuer string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	// If we are not running in trusted mode and there is no issuer, that is ok.
-	if s.trustedKeys == nil && issuer == "" {
+	if s.trustedKeys == nil && issuer == _EMPTY_ {
 		return true
 	}
 	for _, tk := range s.trustedKeys {
@@ -1011,22 +1091,15 @@ func (s *Server) Running() bool {
 
 // Protected check on running state
 func (s *Server) isRunning() bool {
-	s.mu.Lock()
+	s.mu.RLock()
 	running := s.running
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return running
 }
 
 func (s *Server) logPid() error {
 	pidStr := strconv.Itoa(os.Getpid())
-	return ioutil.WriteFile(s.getOpts().PidFile, []byte(pidStr), 0660)
-}
-
-// NewAccountsAllowed returns whether or not new accounts can be created on the fly.
-func (s *Server) NewAccountsAllowed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.opts.AllowNewAccounts
+	return os.WriteFile(s.getOpts().PidFile, []byte(pidStr), 0660)
 }
 
 // numReservedAccounts will return the number of reserved accounts configured in the server.
@@ -1054,12 +1127,12 @@ func (s *Server) decActiveAccounts() {
 // range over all accounts in the sync.Map to count.
 func (s *Server) numAccounts() int {
 	count := 0
-	s.mu.Lock()
+	s.mu.RLock()
 	s.accounts.Range(func(k, v interface{}) bool {
 		count++
 		return true
 	})
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return count
 }
 
@@ -1120,19 +1193,19 @@ func (s *Server) SetSystemAccount(accName string) error {
 // SystemAccount returns the system account if set.
 func (s *Server) SystemAccount() *Account {
 	var sacc *Account
-	s.mu.Lock()
+	s.mu.RLock()
 	if s.sys != nil {
 		sacc = s.sys.account
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return sacc
 }
 
 // GlobalAccount returns the global account.
 // Default clients will use the global account.
 func (s *Server) GlobalAccount() *Account {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.gacc
 }
 
@@ -1144,9 +1217,6 @@ func (s *Server) SetDefaultSystemAccount() error {
 	s.Debugf("Created system account: %q", DEFAULT_SYSTEM_ACCOUNT)
 	return s.SetSystemAccount(DEFAULT_SYSTEM_ACCOUNT)
 }
-
-// For internal sends.
-const internalSendQLen = 256 * 1024
 
 // Assign a system account. Should only be called once.
 // This sets up a server to send and receive messages from
@@ -1187,7 +1257,7 @@ func (s *Server) setSystemAccount(acc *Account) error {
 		sid:     1,
 		servers: make(map[string]*serverUpdate),
 		replies: make(map[string]msgHandler),
-		sendq:   make(chan *pubMsg, internalSendQLen),
+		sendq:   s.newIPQueue("System sendQ"), // of *pubMsg
 		resetCh: make(chan struct{}),
 		sq:      s.newSendQ(),
 		statsz:  eventsHBInterval,
@@ -1318,7 +1388,26 @@ func (s *Server) registerAccountNoLock(acc *Account) *Account {
 	}
 	acc.srv = s
 	acc.updated = time.Now().UTC()
+	accName := acc.Name
+	jsEnabled := len(acc.jsLimits) > 0
 	acc.mu.Unlock()
+
+	if opts := s.getOpts(); opts != nil && len(opts.JsAccDefaultDomain) > 0 {
+		if defDomain, ok := opts.JsAccDefaultDomain[accName]; ok {
+			if jsEnabled {
+				s.Warnf("Skipping Default Domain %q, set for JetStream enabled account %q", defDomain, accName)
+			} else if defDomain != _EMPTY_ {
+				for src, dest := range generateJSMappingTable(defDomain) {
+					// flip src and dest around so the domain is inserted
+					s.Noticef("Adding default domain mapping %q -> %q to account %q %p", dest, src, accName, acc)
+					if err := acc.AddMapping(dest, src); err != nil {
+						s.Errorf("Error adding JetStream default domain mapping: %v", err)
+					}
+				}
+			}
+		}
+	}
+
 	s.accounts.Store(acc.Name, acc)
 	s.tmpAccounts.Delete(acc.Name)
 	s.enableAccountTracking(acc)
@@ -1326,6 +1415,12 @@ func (s *Server) registerAccountNoLock(acc *Account) *Account {
 	// Can not have server lock here.
 	s.mu.Unlock()
 	s.registerSystemImports(acc)
+	// Starting 2.9.0, we are phasing out the optimistic mode, so change
+	// the account to interest-only mode (except if instructed not to do
+	// it in some tests).
+	if s.gateway.enabled && !gwDoNotForceInterestOnlyMode {
+		s.switchAccountToInterestMode(acc.GetName())
+	}
 	s.mu.Lock()
 
 	return nil
@@ -1510,16 +1605,20 @@ func (s *Server) Start() {
 	s.Noticef("Starting nats-server")
 
 	gc := gitCommit
-	if gc == "" {
+	if gc == _EMPTY_ {
 		gc = "not set"
 	}
 
 	// Snapshot server options.
 	opts := s.getOpts()
+	clusterName := s.ClusterName()
 
 	s.Noticef("  Version:  %s", VERSION)
 	s.Noticef("  Git:      [%s]", gc)
 	s.Debugf("  Go build: %s", s.info.GoVersion)
+	if clusterName != _EMPTY_ {
+		s.Noticef("  Cluster:  %s", clusterName)
+	}
 	s.Noticef("  Name:     %s", s.info.Name)
 	if opts.JetStream {
 		s.Noticef("  Node:     %s", getHash(s.info.Name))
@@ -1534,11 +1633,23 @@ func (s *Server) Start() {
 	// Avoid RACE between Start() and Shutdown()
 	s.mu.Lock()
 	s.running = true
+	// Update leafNodeEnabled in case options have changed post NewServer()
+	// and before Start() (we should not be able to allow that, but server has
+	// direct reference to user-provided options - at least before a Reload() is
+	// performed.
+	s.leafNodeEnabled = opts.LeafNode.Port != 0 || len(opts.LeafNode.Remotes) > 0
 	s.mu.Unlock()
 
 	s.grMu.Lock()
 	s.grRunning = true
 	s.grMu.Unlock()
+
+	s.startRateLimitLogExpiration()
+
+	// Pprof http endpoint for the profiler.
+	if opts.ProfPort != 0 {
+		s.StartProfiler()
+	}
 
 	if opts.ConfigFile != _EMPTY_ {
 		s.Noticef("Using configuration file: %s", opts.ConfigFile)
@@ -1552,7 +1663,12 @@ func (s *Server) Start() {
 		s.Noticef("  System  : %q", opc.Audience)
 		s.Noticef("  Operator: %q", opc.Name)
 		s.Noticef("  Issued  : %v", time.Unix(opc.IssuedAt, 0))
-		s.Noticef("  Expires : %v", time.Unix(opc.Expires, 0))
+		switch opc.Expires {
+		case 0:
+			s.Noticef("  Expires : Never")
+		default:
+			s.Noticef("  Expires : %v", time.Unix(opc.Expires, 0))
+		}
 	}
 	if hasOperators && opts.SystemAccount == _EMPTY_ {
 		s.Warnf("Trusted Operators should utilize a System Account")
@@ -1562,13 +1678,17 @@ func (s *Server) Start() {
 			friendlyBytes(int64(MAX_PAYLOAD_MAX_SIZE)))
 	}
 
+	if len(opts.JsAccDefaultDomain) > 0 {
+		s.Warnf("The option `default_js_domain` is a temporary backwards compatibility measure and will be removed")
+	}
+
 	// If we have a memory resolver, check the accounts here for validation exceptions.
 	// This allows them to be logged right away vs when they are accessed via a client.
 	if hasOperators && len(opts.resolverPreloads) > 0 {
 		s.checkResolvePreloads()
 	}
 
-	// Log the pid to a file
+	// Log the pid to a file.
 	if opts.PidFile != _EMPTY_ {
 		if err := s.logPid(); err != nil {
 			s.Fatalf("Could not write pidfile: %v", err)
@@ -1587,14 +1707,21 @@ func (s *Server) Start() {
 		s.SetDefaultSystemAccount()
 	}
 
-	// start up resolver machinery
+	// Start monitoring before enabling other subsystems of the
+	// server to be able to monitor during startup.
+	if err := s.StartMonitoring(); err != nil {
+		s.Fatalf("Can't start monitoring: %v", err)
+		return
+	}
+
+	// Start up resolver machinery.
 	if ar := s.AccountResolver(); ar != nil {
 		if err := ar.Start(s); err != nil {
 			s.Fatalf("Could not start resolver: %v", err)
 			return
 		}
 		// In operator mode, when the account resolver depends on an external system and
-		// the system account is the bootstrapping account, start fetching it
+		// the system account is the bootstrapping account, start fetching it.
 		if len(opts.TrustedOperators) == 1 && opts.SystemAccount != _EMPTY_ && opts.SystemAccount != DEFAULT_SYSTEM_ACCOUNT {
 			_, isMemResolver := ar.(*MemAccResolver)
 			if v, ok := s.accounts.Load(s.opts.SystemAccount); !isMemResolver && ok && v.(*Account).claimJWT == "" {
@@ -1608,10 +1735,10 @@ func (s *Server) Start() {
 						case <-s.quitCh:
 							return
 						case <-t.C:
-							if _, err := fetchAccount(ar, s.opts.SystemAccount); err != nil {
+							sacc := s.SystemAccount()
+							if claimJWT, err := fetchAccount(ar, s.opts.SystemAccount); err != nil {
 								continue
-							}
-							if _, err := s.fetchAccount(s.opts.SystemAccount); err != nil {
+							} else if err = s.updateAccountWithClaimJWT(sacc, claimJWT); err != nil {
 								continue
 							}
 							s.Noticef("System account fetched and updated")
@@ -1632,14 +1759,15 @@ func (s *Server) Start() {
 	// own system account if one is not present.
 	if opts.JetStream {
 		// Make sure someone is not trying to enable on the system account.
-		if sa := s.SystemAccount(); sa != nil && sa.jsLimits != nil {
+		if sa := s.SystemAccount(); sa != nil && len(sa.jsLimits) > 0 {
 			s.Fatalf("Not allowed to enable JetStream on the system account")
 		}
 		cfg := &JetStreamConfig{
-			StoreDir:  opts.StoreDir,
-			MaxMemory: opts.JetStreamMaxMemory,
-			MaxStore:  opts.JetStreamMaxStore,
-			Domain:    opts.JetStreamDomain,
+			StoreDir:   opts.StoreDir,
+			MaxMemory:  opts.JetStreamMaxMemory,
+			MaxStore:   opts.JetStreamMaxStore,
+			Domain:     opts.JetStreamDomain,
+			CompressOK: true,
 		}
 		if err := s.EnableJetStream(cfg); err != nil {
 			s.Fatalf("Can't start JetStream: %v", err)
@@ -1660,7 +1788,7 @@ func (s *Server) Start() {
 				hasGlobal = true
 			}
 			acc.mu.RLock()
-			hasJs := acc.jsLimits != nil
+			hasJs := len(acc.jsLimits) > 0
 			acc.mu.RUnlock()
 			if hasJs {
 				s.checkJetStreamExports()
@@ -1672,7 +1800,9 @@ func (s *Server) Start() {
 		// go ahead and enable JS on $G in case we are in simple mixed mode setup.
 		if total == 2 && hasSys && hasGlobal && !s.standAloneMode() {
 			ga.mu.Lock()
-			ga.jsLimits = dynamicJSAccountLimits
+			ga.jsLimits = map[string]JetStreamAccountLimits{
+				_EMPTY_: dynamicJSAccountLimits,
+			}
 			ga.mu.Unlock()
 			s.checkJetStreamExports()
 			ga.enableAllJetStreamServiceImportsAndMappings()
@@ -1681,12 +1811,6 @@ func (s *Server) Start() {
 
 	// Start OCSP Stapling monitoring for TLS certificates if enabled.
 	s.startOCSPMonitoring()
-
-	// Start monitoring if needed.
-	if err := s.StartMonitoring(); err != nil {
-		s.Fatalf("Can't start monitoring: %v", err)
-		return
-	}
 
 	// Start up gateway if needed. Do this before starting the routes, because
 	// we want to resolve the gateway host:port so that this information can
@@ -1739,17 +1863,21 @@ func (s *Server) Start() {
 		})
 	}
 
-	// Pprof http endpoint for the profiler.
-	if opts.ProfPort != 0 {
-		s.StartProfiler()
-	}
-
 	if opts.PortsFileDir != _EMPTY_ {
 		s.logPorts()
 	}
 
+	if opts.TLSRateLimit > 0 {
+		s.startGoRoutine(s.logRejectedTLSConns)
+	}
+
+	// We've finished starting up.
+	close(s.startupComplete)
+
 	// Wait for clients.
-	s.AcceptLoop(clientListenReady)
+	if !opts.DontListen {
+		s.AcceptLoop(clientListenReady)
+	}
 }
 
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
@@ -1758,8 +1886,8 @@ func (s *Server) Shutdown() {
 	if s == nil {
 		return
 	}
-	// Transfer off any raft nodes that we are a leader by shutting them all down.
-	s.shutdownRaftNodes()
+	// Transfer off any raft nodes that we are a leader by stepping them down.
+	s.stepdownRaftNodes()
 
 	// This is for clustered JetStream and ephemeral consumers.
 	// No-op if not clustered or not running JetStream.
@@ -1796,6 +1924,9 @@ func (s *Server) Shutdown() {
 
 	// Now check jetstream.
 	s.shutdownJetStream()
+
+	// Now shutdown the nodes
+	s.shutdownRaftNodes()
 
 	s.mu.Lock()
 	conns := make(map[uint64]*client)
@@ -2000,6 +2131,23 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	clr = nil
 }
 
+// InProcessConn returns an in-process connection to the server,
+// avoiding the need to use a TCP listener for local connectivity
+// within the same process. This can be used regardless of the
+// state of the DontListen option.
+func (s *Server) InProcessConn() (net.Conn, error) {
+	pl, pr := net.Pipe()
+	if !s.startGoRoutine(func() {
+		s.createClient(pl)
+		s.grWG.Done()
+	}) {
+		pl.Close()
+		pr.Close()
+		return nil, fmt.Errorf("failed to create connection")
+	}
+	return pr, nil
+}
+
 func (s *Server) acceptConnections(l net.Listener, acceptName string, createFunc func(conn net.Conn), errFunc func(err error) bool) {
 	tmpDelay := ACCEPT_MIN_SLEEP
 
@@ -2139,20 +2287,55 @@ func (s *Server) StartMonitoring() error {
 
 // HTTP endpoints
 const (
-	RootPath     = "/"
-	VarzPath     = "/varz"
-	ConnzPath    = "/connz"
-	RoutezPath   = "/routez"
-	GatewayzPath = "/gatewayz"
-	LeafzPath    = "/leafz"
-	SubszPath    = "/subsz"
-	StackszPath  = "/stacksz"
-	AccountzPath = "/accountz"
-	JszPath      = "/jsz"
+	RootPath         = "/"
+	VarzPath         = "/varz"
+	ConnzPath        = "/connz"
+	RoutezPath       = "/routez"
+	GatewayzPath     = "/gatewayz"
+	LeafzPath        = "/leafz"
+	SubszPath        = "/subsz"
+	StackszPath      = "/stacksz"
+	AccountzPath     = "/accountz"
+	AccountStatzPath = "/accstatz"
+	JszPath          = "/jsz"
+	HealthzPath      = "/healthz"
+	IPQueuesPath     = "/ipqueuesz"
 )
 
 func (s *Server) basePath(p string) string {
 	return path.Join(s.httpBasePath, p)
+}
+
+type captureHTTPServerLog struct {
+	s      *Server
+	prefix string
+}
+
+func (cl *captureHTTPServerLog) Write(p []byte) (int, error) {
+	var buf [128]byte
+	var b = buf[:0]
+
+	b = append(b, []byte(cl.prefix)...)
+	offset := 0
+	if bytes.HasPrefix(p, []byte("http:")) {
+		offset = 6
+	}
+	b = append(b, p[offset:]...)
+	cl.s.Errorf(string(b))
+	return len(p), nil
+}
+
+// The TLS configuration is passed to the listener when the monitoring
+// "server" is setup. That prevents TLS configuration updates on reload
+// from being used. By setting this function in tls.Config.GetConfigForClient
+// we instruct the TLS handshake to ask for the tls configuration to be
+// used for a specific client. We don't care which client, we always use
+// the same TLS configuration.
+func (s *Server) getMonitoringTLSConfig(_ *tls.ClientHelloInfo) (*tls.Config, error) {
+	opts := s.getOpts()
+	tc := opts.TLSConfig.Clone()
+	tc.ClientAuth = tls.NoClientCert
+	return tc, nil
 }
 
 // Start the monitoring server
@@ -2177,6 +2360,7 @@ func (s *Server) startMonitoring(secure bool) error {
 		}
 		hp = net.JoinHostPort(opts.HTTPHost, strconv.Itoa(port))
 		config := opts.TLSConfig.Clone()
+		config.GetConfigForClient = s.getMonitoringTLSConfig
 		config.ClientAuth = tls.NoClientCert
 		httpListener, err = tls.Listen("tcp", hp, config)
 
@@ -2193,8 +2377,8 @@ func (s *Server) startMonitoring(secure bool) error {
 		return fmt.Errorf("can't listen to the monitor port: %v", err)
 	}
 
-	s.Noticef("Starting %s monitor on %s", monitorProtocol,
-		net.JoinHostPort(opts.HTTPHost, strconv.Itoa(httpListener.Addr().(*net.TCPAddr).Port)))
+	rport := httpListener.Addr().(*net.TCPAddr).Port
+	s.Noticef("Starting %s monitor on %s", monitorProtocol, net.JoinHostPort(opts.HTTPHost, strconv.Itoa(rport)))
 
 	mux := http.NewServeMux()
 
@@ -2218,8 +2402,15 @@ func (s *Server) startMonitoring(secure bool) error {
 	mux.HandleFunc(s.basePath(StackszPath), s.HandleStacksz)
 	// Accountz
 	mux.HandleFunc(s.basePath(AccountzPath), s.HandleAccountz)
+	// Accstatz
+	mux.HandleFunc(s.basePath(AccountStatzPath), s.HandleAccountStatz)
 	// Jsz
 	mux.HandleFunc(s.basePath(JszPath), s.HandleJsz)
+	// Healthz
+	mux.HandleFunc(s.basePath(HealthzPath), s.HandleHealthz)
+	// IPQueuesz
+	mux.HandleFunc(s.basePath(IPQueuesPath), s.HandleIPQueuesz)
+
 	// Do not set a WriteTimeout because it could cause cURL/browser
 	// to return empty response or unable to display page if the
 	// server needs more time to build the response.
@@ -2227,6 +2418,7 @@ func (s *Server) startMonitoring(secure bool) error {
 		Addr:           hp,
 		Handler:        mux,
 		MaxHeaderBytes: 1 << 20,
+		ErrorLog:       log.New(&captureHTTPServerLog{s, "monitoring: "}, _EMPTY_, 0),
 	}
 	s.mu.Lock()
 	if s.shutdown {
@@ -2249,7 +2441,6 @@ func (s *Server) startMonitoring(secure bool) error {
 			}
 		}
 		srv.Close()
-		srv.Handler = nil
 		s.mu.Lock()
 		s.httpHandler = nil
 		s.mu.Unlock()
@@ -2409,6 +2600,13 @@ func (s *Server) createClient(conn net.Conn) *client {
 
 	// Check for TLS
 	if !isClosed && tlsRequired {
+		if s.connRateCounter != nil && !s.connRateCounter.allow() {
+			c.mu.Unlock()
+			c.sendErr("Connection throttling is active. Please try again later.")
+			c.closeConnection(MaxConnectionsExceeded)
+			return nil
+		}
+
 		// If we have a prebuffer create a multi-reader.
 		if len(pre) > 0 {
 			c.nc = &tlsMixConn{c.nc, bytes.NewBuffer(pre)}
@@ -2471,7 +2669,7 @@ func (s *Server) saveClosedClient(c *client, nc net.Conn, reason ClosedState) {
 	c.mu.Lock()
 
 	cc := &closedClient{}
-	cc.fill(c, nc, now)
+	cc.fill(c, nc, now, false)
 	cc.Stop = &now
 	cc.Reason = reason.String()
 
@@ -2654,30 +2852,30 @@ func (s *Server) addToTempClients(cid uint64, c *client) bool {
 
 // NumRoutes will report the number of registered routes.
 func (s *Server) NumRoutes() int {
-	s.mu.Lock()
+	s.mu.RLock()
 	nr := len(s.routes)
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return nr
 }
 
 // NumRemotes will report number of registered remotes.
 func (s *Server) NumRemotes() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.remotes)
 }
 
 // NumLeafNodes will report number of leaf node connections.
 func (s *Server) NumLeafNodes() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.leafs)
 }
 
 // NumClients will report the number of registered clients.
 func (s *Server) NumClients() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.clients)
 }
 
@@ -2688,22 +2886,22 @@ func (s *Server) GetClient(cid uint64) *client {
 
 // getClient will return the client associated with cid.
 func (s *Server) getClient(cid uint64) *client {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.clients[cid]
 }
 
 // GetLeafNode returns the leafnode associated with the cid.
 func (s *Server) GetLeafNode(cid uint64) *client {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.leafs[cid]
 }
 
 // NumSubscriptions will report how many subscriptions are active.
 func (s *Server) NumSubscriptions() uint32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.numSubscriptions()
 }
 
@@ -2728,15 +2926,15 @@ func (s *Server) NumSlowConsumers() int64 {
 
 // ConfigTime will report the last time the server configuration was loaded.
 func (s *Server) ConfigTime() time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.configTime
 }
 
 // Addr will return the net.Addr object for the current listener.
 func (s *Server) Addr() net.Addr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.listener == nil {
 		return nil
 	}
@@ -2745,8 +2943,8 @@ func (s *Server) Addr() net.Addr {
 
 // MonitorAddr will return the net.Addr object for the monitoring listener.
 func (s *Server) MonitorAddr() *net.TCPAddr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.http == nil {
 		return nil
 	}
@@ -2755,8 +2953,8 @@ func (s *Server) MonitorAddr() *net.TCPAddr {
 
 // ClusterAddr returns the net.Addr object for the route listener.
 func (s *Server) ClusterAddr() *net.TCPAddr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.routeListener == nil {
 		return nil
 	}
@@ -2765,8 +2963,8 @@ func (s *Server) ClusterAddr() *net.TCPAddr {
 
 // ProfilerAddr returns the net.Addr object for the profiler listener.
 func (s *Server) ProfilerAddr() *net.TCPAddr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.profiler == nil {
 		return nil
 	}
@@ -2785,14 +2983,14 @@ func (s *Server) readyForConnections(d time.Duration) error {
 
 	end := time.Now().Add(d)
 	for time.Now().Before(end) {
-		s.mu.Lock()
-		chk["server"] = info{ok: s.listener != nil, err: s.listenerErr}
+		s.mu.RLock()
+		chk["server"] = info{ok: s.listener != nil || opts.DontListen, err: s.listenerErr}
 		chk["route"] = info{ok: (opts.Cluster.Port == 0 || s.routeListener != nil), err: s.routeListenerErr}
-		chk["gateway"] = info{ok: (opts.Gateway.Name == "" || s.gatewayListener != nil), err: s.gatewayListenerErr}
+		chk["gateway"] = info{ok: (opts.Gateway.Name == _EMPTY_ || s.gatewayListener != nil), err: s.gatewayListenerErr}
 		chk["leafNode"] = info{ok: (opts.LeafNode.Port == 0 || s.leafNodeListener != nil), err: s.leafNodeListenerErr}
 		chk["websocket"] = info{ok: (opts.Websocket.Port == 0 || s.websocket.listener != nil), err: s.websocket.listenerErr}
 		chk["mqtt"] = info{ok: (opts.MQTT.Port == 0 || s.mqtt.listener != nil), err: s.mqtt.listenerErr}
-		s.mu.Unlock()
+		s.mu.RUnlock()
 
 		var numOK int
 		for _, inf := range chk {
@@ -2801,9 +2999,21 @@ func (s *Server) readyForConnections(d time.Duration) error {
 			}
 		}
 		if numOK == len(chk) {
+			// In the case of DontListen option (no accept loop), we still want
+			// to make sure that Start() has done all the work, so we wait on
+			// that.
+			if opts.DontListen {
+				select {
+				case <-s.startupComplete:
+				case <-time.After(d):
+					return fmt.Errorf("failed to be ready for connections after %s: startup did not complete", d)
+				}
+			}
 			return nil
 		}
-		time.Sleep(25 * time.Millisecond)
+		if d > 25*time.Millisecond {
+			time.Sleep(25 * time.Millisecond)
+		}
 	}
 
 	failed := make([]string, 0, len(chk))
@@ -2872,20 +3082,20 @@ func (s *Server) startGoRoutine(f func()) bool {
 }
 
 func (s *Server) numClosedConns() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.closed.len()
 }
 
 func (s *Server) totalClosedConns() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.closed.totalConns()
 }
 
 func (s *Server) closedClients() []*closedClient {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.closed.closedClients()
 }
 
@@ -3037,7 +3247,7 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 	if s.readyForListeners(maxWait) {
 		opts := s.getOpts()
 
-		s.mu.Lock()
+		s.mu.RLock()
 		tls := s.info.TLSRequired
 		listener := s.listener
 		httpListener := s.http
@@ -3045,7 +3255,7 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		profileListener := s.profiler
 		wsListener := s.websocket.listener
 		wss := s.websocket.tls
-		s.mu.Unlock()
+		s.mu.RUnlock()
 
 		ports := Ports{}
 
@@ -3133,7 +3343,7 @@ func (s *Server) logPorts() {
 				s.Errorf("Error marshaling ports file: %v", err)
 				return
 			}
-			if err := ioutil.WriteFile(portsFile, data, 0666); err != nil {
+			if err := os.WriteFile(portsFile, data, 0666); err != nil {
 				s.Errorf("Error writing ports file (%s): %v", portsFile, err)
 				return
 			}
@@ -3146,9 +3356,9 @@ func (s *Server) logPorts() {
 func (s *Server) readyForListeners(dur time.Duration) bool {
 	end := time.Now().Add(dur)
 	for time.Now().Before(end) {
-		s.mu.Lock()
+		s.mu.RLock()
 		listeners := s.serviceListeners()
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		if len(listeners) == 0 {
 			return false
 		}
@@ -3196,8 +3406,8 @@ func (s *Server) serviceListeners() []net.Listener {
 
 // Returns true if in lame duck mode.
 func (s *Server) isLameDuckMode() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.ldm
 }
 
@@ -3234,7 +3444,7 @@ func (s *Server) lameDuckMode() {
 
 	// If we are running any raftNodes transfer leaders.
 	if hadTransfers := s.transferRaftLeaders(); hadTransfers {
-		// They will tranfer leadership quickly, but wait here for a second.
+		// They will transfer leadership quickly, but wait here for a second.
 		select {
 		case <-time.After(time.Second):
 		case <-s.quitCh:
@@ -3380,6 +3590,7 @@ func (s *Server) acceptError(acceptName string, err error, tmpDelay time.Duratio
 	if !s.isRunning() {
 		return -1
 	}
+	//lint:ignore SA1019 We want to retry on a bunch of errors here.
 	if ne, ok := err.(net.Error); ok && ne.Temporary() {
 		s.Errorf("Temporary %s Accept Error(%v), sleeping %dms", acceptName, ne, tmpDelay/time.Millisecond)
 		select {
@@ -3464,32 +3675,6 @@ func (s *Server) shouldReportConnectErr(firstConnect bool, attempts int) bool {
 	return false
 }
 
-// Invoked for route, leaf and gateway connections. Set the very first
-// PING to a lower interval to capture the initial RTT.
-// After that the PING interval will be set to the user defined value.
-// Client lock should be held.
-func (s *Server) setFirstPingTimer(c *client) {
-	opts := s.getOpts()
-	d := opts.PingInterval
-
-	if !opts.DisableShortFirstPing {
-		if c.kind != CLIENT {
-			if d > firstPingInterval {
-				d = firstPingInterval
-			}
-			if c.kind == GATEWAY {
-				d = adjustPingIntervalForGateway(d)
-			}
-		} else if d > firstClientPingInterval {
-			d = firstClientPingInterval
-		}
-	}
-	// We randomize the first one by an offset up to 20%, e.g. 2m ~= max 24s.
-	addDelay := rand.Int63n(int64(d / 5))
-	d += time.Duration(addDelay)
-	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
-}
-
 func (s *Server) updateRemoteSubscription(acc *Account, sub *subscription, delta int32) {
 	s.updateRouteSubscriptionMap(acc, sub, delta)
 	if s.gateway.enabled {
@@ -3497,4 +3682,40 @@ func (s *Server) updateRemoteSubscription(acc *Account, sub *subscription, delta
 	}
 
 	s.updateLeafNodes(acc, sub, delta)
+}
+
+func (s *Server) startRateLimitLogExpiration() {
+	interval := time.Second
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.quitCh:
+				return
+			case interval = <-s.rateLimitLoggingCh:
+				ticker.Reset(interval)
+			case <-ticker.C:
+				s.rateLimitLogging.Range(func(k, v interface{}) bool {
+					start := v.(time.Time)
+					if time.Since(start) >= interval {
+						s.rateLimitLogging.Delete(k)
+					}
+					return true
+				})
+			}
+		}
+	})
+}
+
+func (s *Server) changeRateLimitLogInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	select {
+	case s.rateLimitLoggingCh <- d:
+	default:
+	}
 }
